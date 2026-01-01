@@ -15,8 +15,8 @@ import time
 import json
 from typing import List, Optional
 
-from orbit_leo import DEFAULT_ORBIT
-from rf_channel_leo import propagate
+from common.orbit_leo import DEFAULT_ORBIT
+from common.rf_channel_leo import propagate
 
 BBU_IP = "127.0.0.1"
 

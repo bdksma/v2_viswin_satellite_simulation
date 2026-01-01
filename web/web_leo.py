@@ -16,7 +16,7 @@ BBU_TM_PORT = 7002   # BBU -> Web TM (TCP stream)
 BBU_TC_PORT = 7001   # Web -> BBU TC (TCP short connection)
 
 st.set_page_config(page_title="Satellite Web Monitor")
-st.title("🛰️ Satellite Web Monitoring (LEO viswin)")
+st.title("🛰️ LEO Satellite Web Monitoring")
 
 # ================= SESSION STATE =================
 if "tm_buffer" not in st.session_state:
