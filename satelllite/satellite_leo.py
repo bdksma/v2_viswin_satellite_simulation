@@ -1,72 +1,37 @@
-# satellite_node.py
-# ==========================================
-# SIMULASI SATELLITE NODE (LEO, viswin-aware) + IMAGE RAW TX
-# - Visibility window (elev > mask) dari orbit.py
-# - Doppler dari orbit.py
-# - Downlink TM sebagai "burst packets" mengikuti kapasitas rate_dl_mbps
-# - Downlink IMG (raw) sebagai chunk packets saat visible
-# - Uplink TC diterima kapan saja, tapi dieksekusi hanya saat visible
-# - RF channel effects dari rf_channel.py (loss/ber/fade)
-# ==========================================
+# satellite_node.py (FINAL - IMG noisy+redundant)
 
 from __future__ import annotations
-
-import base64
-import os
-import socket
-import time
-import threading
-import json
+import base64, os, socket, time, threading, json
 from typing import List, Dict, Any, Optional
 
 from common.orbit_leo import DEFAULT_ORBIT
 from common.rf_channel_leo import propagate
 
-# ================================
-# NETWORK CONFIG
-# ================================
 SAT_IP = "127.0.0.1"
-SAT_TC_PORT = 5002          # receive TC from BBU (UDP)
-
+SAT_TC_PORT = 5002
 BBU_IP = "127.0.0.1"
-BBU_TM_PORT = 6001          # send TM/IMG to BBU (UDP)
+BBU_TM_PORT = 6001
 
-# ================================
-# TM PACKET / BURST CONFIG
-# ================================
 TIME_STEP_S = 1.0
 PAYLOAD_BYTES = 256
 HEADER_BYTES = 32
 BITS_PER_PACKET = (PAYLOAD_BYTES + HEADER_BYTES) * 8
 MAX_PKTS_PER_STEP = 2000
 
-# ================================
-# IMAGE RAW CONFIG
-# ================================
 RAW_FILE_PATH = "raw_224mb.bin"
-
-# 2048x2048 12-bit packed => 6,291,456 bytes per frame (IF truly packed-only)
 FRAME_BYTES = (2048 * 2048 * 12) // 8
 
-IMG_CHUNK_BYTES = 1200
-
-# Testing: kirim hanya frame pertama
+IMG_CHUNK_BYTES = 6000
 SEND_ONLY_FIRST_FRAME = True
+IMG_CHUNK_DELAY_S = 0.0005
 
-# Throttle per chunk
-IMG_CHUNK_DELAY_S = 0.0015
-
-# IMPORTANT: keep RF/noise scheme BUT make IMG survive loss:
-# retransmit each chunk a few times (still passes through propagate)
-IMG_REPEAT = 3
+# redundancy copies per chunk (for "filter+amplifier" at receiver)
+IMG_REP_COPIES = 5
 
 running = True
-
-# ================================
-# ONBOARD TC QUEUE
-# ================================
 _tc_queue: List[str] = []
 _tc_lock = threading.Lock()
+_img_sent_once = False
 
 def _enqueue_tc(cmd: str):
     with _tc_lock:
@@ -74,54 +39,25 @@ def _enqueue_tc(cmd: str):
 
 def _dequeue_tc() -> Optional[str]:
     with _tc_lock:
-        if not _tc_queue:
-            return None
-        return _tc_queue.pop(0)
-
-# ================================
-# IMAGE TX STATE
-# ================================
-_img_sent_once = False
+        return _tc_queue.pop(0) if _tc_queue else None
 
 def _iter_frames_from_raw_file(path: str):
-    """
-    Yield (frame_id, frame_bytes) reading fixed FRAME_BYTES.
-    NOTE: if your raw has per-line overhead, this may not match real frame boundaries.
-    But pipeline + decoder will still try header mode first.
-    """
     with open(path, "rb") as f:
         frame_id = 0
         while True:
             buf = f.read(FRAME_BYTES)
-            if not buf:
-                break
-            if len(buf) < FRAME_BYTES:
+            if not buf or len(buf) < FRAME_BYTES:
                 break
             yield frame_id, buf
             frame_id += 1
 
 def send_image_if_needed(sock: socket.socket, visible: bool, rate_dl_mbps: float, elev: float):
-    """
-    Kirim IMG raw sebagai paket JSON:
-      {
-        "type":"IMG",
-        "frame_id": int,
-        "chunk_idx": int,
-        "last": bool,
-        "payload_b64": str
-      }
-    Still uses propagate() to keep noise/loss/fade,
-    but each chunk is repeated IMG_REPEAT times to increase completion chance.
-    """
     global _img_sent_once
-
     if not visible or rate_dl_mbps <= 0.0:
         return
-
     if not os.path.exists(RAW_FILE_PATH):
-        print(f"[SAT] RAW file not found: {RAW_FILE_PATH}")
+        print(f"[SAT] RAW not found: {RAW_FILE_PATH}")
         return
-
     if SEND_ONLY_FIRST_FRAME and _img_sent_once:
         return
 
@@ -131,21 +67,20 @@ def send_image_if_needed(sock: socket.socket, visible: bool, rate_dl_mbps: float
 
         chunks = [frame[i:i + IMG_CHUNK_BYTES] for i in range(0, len(frame), IMG_CHUNK_BYTES)]
         total = len(chunks)
-
-        print(f"[SAT] IMG TX start frame={frame_id} chunks={total} (visible={visible}, elev={elev:.1f}deg, rate={rate_dl_mbps*1e3:.1f}kbps)")
+        print(f"[SAT] IMG TX start frame={frame_id} chunks={total} rep={IMG_REP_COPIES} elev={elev:.1f}")
 
         for idx, ch in enumerate(chunks):
-            pkt = {
-                "type": "IMG",
-                "frame_id": frame_id,
-                "chunk_idx": idx,
-                "last": (idx == total - 1),
-                "payload_b64": base64.b64encode(ch).decode("ascii"),
-                "corrupted": False,
-            }
+            payload_b64 = base64.b64encode(ch).decode("ascii")
 
-            # repeat sending each chunk to survive RF loss
-            for _r in range(IMG_REPEAT):
+            for rep in range(IMG_REP_COPIES):
+                pkt = {
+                    "type": "IMG",
+                    "frame_id": frame_id,
+                    "chunk_idx": idx,
+                    "last": (idx == total - 1),
+                    "rep": rep,                 # <-- NEW
+                    "payload_b64": payload_b64,
+                }
                 out = propagate(pkt, elev_deg=elev, direction="downlink")
                 if out is not None:
                     sock.sendto(json.dumps(out).encode("utf-8"), (BBU_IP, BBU_TM_PORT))
@@ -154,14 +89,10 @@ def send_image_if_needed(sock: socket.socket, visible: bool, rate_dl_mbps: float
                 time.sleep(IMG_CHUNK_DELAY_S)
 
         print(f"[SAT] IMG TX done frame={frame_id}")
-
         if SEND_ONLY_FIRST_FRAME:
             _img_sent_once = True
             break
 
-# ================================
-# THREAD: SEND TELEMETRY (DOWNLINK)
-# ================================
 def telemetry_sender():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     seq = 0
@@ -173,22 +104,15 @@ def telemetry_sender():
         doppler = float(st["doppler_hz"])
         rate_dl_mbps = float(st["rate_dl_mbps"])
 
-        # 1) kirim image raw (hanya saat visible)
-        send_image_if_needed(sock, visible=visible, rate_dl_mbps=rate_dl_mbps, elev=elev)
+        send_image_if_needed(sock, visible, rate_dl_mbps, elev)
 
-        # 2) TM biasa
         if not visible or rate_dl_mbps <= 0.0:
-            print(f"[SAT] TM gen (NOT visible) elev={elev:.1f}deg doppler={doppler:.0f}Hz")
             time.sleep(TIME_STEP_S)
             continue
 
         bits_step = rate_dl_mbps * 1e6 * TIME_STEP_S
         max_pkts = int(bits_step // BITS_PER_PACKET)
-        if max_pkts <= 0:
-            time.sleep(TIME_STEP_S)
-            continue
-        if max_pkts > MAX_PKTS_PER_STEP:
-            max_pkts = MAX_PKTS_PER_STEP
+        max_pkts = max(0, min(max_pkts, MAX_PKTS_PER_STEP))
 
         for _ in range(max_pkts):
             tm_packet: Dict[str, Any] = {
@@ -202,63 +126,41 @@ def telemetry_sender():
                 "payload_len": PAYLOAD_BYTES,
                 "duplicated": False,
             }
-
             tm_out = propagate(tm_packet, elev_deg=elev, direction="downlink")
             if tm_out is not None:
                 sock.sendto(json.dumps(tm_out).encode("utf-8"), (BBU_IP, BBU_TM_PORT))
             seq = (seq + 1) & 0xFFFFFFFF
 
-        print(f"[SAT] DOWNLINK: elev={elev:.1f}deg rate={rate_dl_mbps*1e3:.1f}kbps sent_pkts={max_pkts}")
         time.sleep(TIME_STEP_S)
 
-# ================================
-# THREAD: RECEIVE TELECOMMAND (UPLINK RX)
-# ================================
 def telecommand_receiver():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind((SAT_IP, SAT_TC_PORT))
     print("[SAT] Telecommand receiver listening (UDP)")
-
     while running:
         data, _ = sock.recvfrom(4096)
-        cmd = data.decode("utf-8", errors="replace").strip()
-        _enqueue_tc(cmd)
-        print(f"[SAT] TC RECEIVED (queued): {cmd}")
+        _enqueue_tc(data.decode("utf-8", errors="replace").strip())
 
-# ================================
-# THREAD: EXECUTE TC WHEN VISIBLE
-# ================================
 def telecommand_executor():
     while running:
         st = DEFAULT_ORBIT.get_state()
         if not st["visible"]:
             time.sleep(0.5)
             continue
-
         cmd = _dequeue_tc()
         if cmd is None:
             time.sleep(0.2)
             continue
-
         pkt = {"type": "TC", "cmd": cmd, "ts": time.time(), "corrupted": False}
         pkt2 = propagate(pkt, elev_deg=float(st["elev_deg"]), direction="uplink")
-        if pkt2 is None:
-            print(f"[SAT] TC LOST (RF): {cmd}")
+        if pkt2 is None or pkt2.get("corrupted"):
             continue
-
-        if pkt2.get("corrupted"):
-            print(f"[SAT] TC CORRUPTED -> ignored: {cmd}")
-            continue
-
         print(f"[SAT] TC EXECUTED: {cmd}")
 
-# ================================
-# MAIN
-# ================================
 if __name__ == "__main__":
-    print("=== SATELLITE NODE STARTED (LEO viswin + IMG) ===")
+    print("=== SATELLITE NODE STARTED (LEO viswin + IMG redundant) ===")
     print(f"[SAT] RAW_FILE_PATH={RAW_FILE_PATH} exists={os.path.exists(RAW_FILE_PATH)} size={os.path.getsize(RAW_FILE_PATH) if os.path.exists(RAW_FILE_PATH) else 0}")
-    print(f"[SAT] SEND_ONLY_FIRST_FRAME={SEND_ONLY_FIRST_FRAME}, IMG_CHUNK_BYTES={IMG_CHUNK_BYTES}, IMG_REPEAT={IMG_REPEAT}")
+    print(f"[SAT] IMG_CHUNK_BYTES={IMG_CHUNK_BYTES} IMG_REP_COPIES={IMG_REP_COPIES}")
 
     threads = [
         threading.Thread(target=telemetry_sender, daemon=True),
@@ -267,10 +169,8 @@ if __name__ == "__main__":
     ]
     for t in threads:
         t.start()
-
     try:
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
         running = False
-        print("\n[SAT] Shutting down")

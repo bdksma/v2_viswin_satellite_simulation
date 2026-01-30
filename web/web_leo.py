@@ -1,7 +1,5 @@
-# web_app.py
-import os
-import socket
-import time
+# web_app.py (show two images noisy vs fixed)
+import os, socket, time
 import streamlit as st
 
 BBU_IP = "127.0.0.1"
@@ -18,8 +16,15 @@ if "tm_socket" not in st.session_state:
     st.session_state.connected = False
 if "rx_buf" not in st.session_state:
     st.session_state.rx_buf = ""
-if "latest_image" not in st.session_state:
-    st.session_state.latest_image = {"frame_id": None, "png": None, "tif": None}
+
+if "latest" not in st.session_state:
+    st.session_state.latest = {
+        "frame_id": None,
+        "noisy_png": None,
+        "fixed_png": None,
+        "noisy_tif": None,
+        "fixed_tif": None,
+    }
 
 if not st.session_state.connected:
     try:
@@ -44,38 +49,40 @@ def handle_line(line: str):
     else:
         mode, payload = "UNK", line
 
-    if payload.startswith("IMG|"):
+    # IMG2 message
+    if payload.startswith("IMG2|"):
         parts = payload.split("|")
-        if len(parts) >= 4:
-            try:
-                frame_id = int(parts[1])
-            except Exception:
-                frame_id = None
-            png_path = parts[2]
-            tif_path = parts[3]
-            st.session_state.latest_image = {"frame_id": frame_id, "png": png_path, "tif": tif_path}
-            st.session_state.tm_buffer.append(("IMG", payload))
+        # IMG2|frame_id|noisy_png|fixed_png|noisy_tif|fixed_tif
+        if len(parts) >= 6:
+            st.session_state.latest = {
+                "frame_id": int(parts[1]),
+                "noisy_png": parts[2],
+                "fixed_png": parts[3],
+                "noisy_tif": parts[4],
+                "fixed_tif": parts[5],
+            }
+            st.session_state.tm_buffer.append(("IMG2", payload))
             st.session_state.tm_buffer = st.session_state.tm_buffer[-200:]
         return
 
     st.session_state.tm_buffer.append((mode, payload))
     st.session_state.tm_buffer = st.session_state.tm_buffer[-200:]
 
-if st.session_state.connected:
-    try:
-        data = st.session_state.tm_socket.recv(65535)
-        if data:
-            st.session_state.rx_buf += data.decode(errors="replace")
-            while "\n" in st.session_state.rx_buf:
-                line, st.session_state.rx_buf = st.session_state.rx_buf.split("\n", 1)
-                handle_line(line)
-    except BlockingIOError:
-        pass
-    except Exception:
-        st.session_state.connected = False
-        st.session_state.tm_socket = None
+# receive stream
+try:
+    data = st.session_state.tm_socket.recv(65535)
+    if data:
+        st.session_state.rx_buf += data.decode(errors="replace")
+        while "\n" in st.session_state.rx_buf:
+            line, st.session_state.rx_buf = st.session_state.rx_buf.split("\n", 1)
+            handle_line(line)
+except BlockingIOError:
+    pass
+except Exception:
+    st.session_state.connected = False
+    st.session_state.tm_socket = None
 
-col_left, col_right = st.columns([1, 1])
+col_left, col_right = st.columns([1, 2])
 
 with col_left:
     st.subheader("📡 Telecommand (uplink)")
@@ -91,30 +98,31 @@ with col_left:
             st.error(f"TC failed: {e}")
 
 with col_right:
-    st.subheader("🖼 Latest Image (decoded)")
-    li = st.session_state.latest_image
-    if li["png"]:
-        if os.path.exists(li["png"]):
-            st.write(f"Frame ID: **{li['frame_id']}**")
-            st.image(li["png"], caption=os.path.basename(li["png"]), use_container_width=True)
-            st.caption(f"TIFF saved at: {li['tif']}")
-        else:
-            st.warning(f"PNG path not found yet: {li['png']}")
+    st.subheader("🖼 Latest Image (Noisy vs Fixed)")
+    li = st.session_state.latest
+    if li["noisy_png"] and os.path.exists(li["noisy_png"]) and li["fixed_png"] and os.path.exists(li["fixed_png"]):
+        st.write(f"Frame ID: **{li['frame_id']}**")
+        c1, c2 = st.columns(2)
+        with c1:
+            st.caption("Noisy (before filter/amplifier)")
+            st.image(li["noisy_png"], use_container_width=True)
+        with c2:
+            st.caption("Fixed (after filter/amplifier)")
+            st.image(li["fixed_png"], use_container_width=True)
     else:
-        st.info("No decoded image yet. Waiting for IMG frame...")
+        st.info("No decoded image yet. Waiting for IMG2 frame...")
 
 st.subheader("📈 Telemetry (downlink)")
 if st.session_state.tm_buffer:
-    for mode, payload in reversed(st.session_state.tm_buffer[-30:]):
-        preview = payload[:350]
+    for mode, payload in reversed(st.session_state.tm_buffer[-20:]):
         if mode == "LIVE":
-            st.success(f"🟢 LIVE  {preview}")
+            st.success(f"🟢 LIVE  {payload[:250]}")
         elif mode == "HIST":
-            st.info(f"🕒 HIST  {preview}")
-        elif mode == "IMG":
-            st.warning(f"🖼 IMG  {preview}")
+            st.info(f"🕒 HIST  {payload[:250]}")
+        elif mode == "IMG2":
+            st.warning(f"🖼 IMG2  {payload[:250]}")
         else:
-            st.write(preview)
+            st.write(payload[:250])
 else:
     st.info("Waiting telemetry...")
 

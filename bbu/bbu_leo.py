@@ -1,31 +1,16 @@
-# bbu_node.py
-# ==========================================
-# SIMULASI BBU NODE (LEO viswin-aware) + IMAGE REASSEMBLY
-# - Receive TM/IMG from satellite (UDP)
-# - Stream to Web (TCP) newline framed
-# - Reassemble IMG -> decode -> save PNG + TIFF
-# ==========================================
-
+# bbu_node.py (FINAL - two outputs noisy vs fixed)
 from __future__ import annotations
-
-import base64
-import json
-import os
-import socket
-import threading
-import time
+import base64, json, os, socket, threading, time
 from typing import Dict, List, Optional, Tuple
 
 from common.orbit_leo import DEFAULT_ORBIT
-from common.rf_channel_leo import propagate  # keep for TC uplink simulation
+from common.rf_channel_leo import propagate
 from common.raw_to_image import decode_one_frame, save_png_tiff
 
 BBU_IP = "127.0.0.1"
-
 BBU_TM_PORT = 6001
 SAT_IP = "127.0.0.1"
 SAT_TC_PORT = 5002
-
 BBU_TC_PORT = 7001
 BBU_TM_PORT_WEB = 7002
 
@@ -40,45 +25,95 @@ telecommand_queue: List[str] = []
 web_tm_conn: Optional[socket.socket] = None
 web_tm_lock = threading.Lock()
 
+def majority_vote_bytes(copies: List[bytes]) -> bytes:
+    """
+    Majority vote per byte.
+    Assumes copies same length. If lengths differ, use min length.
+    """
+    if not copies:
+        return b""
+    m = min(len(c) for c in copies)
+    copies = [c[:m] for c in copies]
+    if len(copies) == 1:
+        return copies[0]
+
+    # byte-wise voting using histogram (fast enough for chunk <= 6000 and copies <= 7)
+    out = bytearray(m)
+    for i in range(m):
+        freq = {}
+        for c in copies:
+            b = c[i]
+            freq[b] = freq.get(b, 0) + 1
+        out[i] = max(freq.items(), key=lambda x: x[1])[0]
+    return bytes(out)
+
 class ImageReassembler:
+    """
+    Store multiple reps per chunk:
+      frames[frame_id]["chunks"][chunk_idx]["reps"][rep_id] = bytes
+    """
     def __init__(self):
         self.frames: Dict[int, Dict] = {}
         self.lock = threading.Lock()
 
-    def push(self, pkt: dict) -> Optional[Tuple[int, bytes]]:
+    def push(self, pkt: dict) -> Optional[Tuple[int, bytes, bytes]]:
+        """
+        Return (frame_id, raw_noisy, raw_fixed) when complete.
+        """
         try:
             frame_id = int(pkt["frame_id"])
             idx = int(pkt["chunk_idx"])
             last = bool(pkt.get("last", False))
+            rep = int(pkt.get("rep", 0))
             payload_b64 = pkt["payload_b64"]
-            data = base64.b64decode(payload_b64)
+            # base64 may be corrupted -> decode may fail
+            data = base64.b64decode(payload_b64, validate=False)
         except Exception:
             return None
 
         with self.lock:
             st = self.frames.setdefault(frame_id, {"chunks": {}, "last_idx": None, "t0": time.time()})
-            # dedup: if repeated chunk arrives, overwrite same idx (OK)
-            st["chunks"][idx] = data
+            ch = st["chunks"].setdefault(idx, {"reps": {}, "t0": time.time()})
+            ch["reps"][rep] = data
 
-            if idx % 200 == 0:
-                print(f"[BBU] IMG RX frame={frame_id} got={len(st['chunks'])} last={st['last_idx']}")
+            if idx < 5:
+                print(f"[BBU] IMG RX frame={frame_id} idx={idx} rep={rep} last={last} reps={len(ch['reps'])}")
 
             if last:
                 st["last_idx"] = idx
-                print(f"[BBU] IMG last chunk received frame={frame_id} last_idx={idx} got={len(st['chunks'])}")
+                print(f"[BBU] IMG last chunk received frame={frame_id} last_idx={idx} got_chunks={len(st['chunks'])}")
 
             if st["last_idx"] is None:
                 return None
 
             last_idx = st["last_idx"]
-            if all(i in st["chunks"] for i in range(last_idx + 1)):
-                raw = b"".join(st["chunks"][i] for i in range(last_idx + 1))
-                del self.frames[frame_id]
-                return frame_id, raw
 
-        return None
+            # complete chunks?
+            if not all(i in st["chunks"] for i in range(last_idx + 1)):
+                return None
 
-    def cleanup(self, max_age_s: float = 180.0):
+            # Build raw_noisy (take rep=0 if exists else first)
+            raw_noisy_parts = []
+            raw_fixed_parts = []
+            for i in range(last_idx + 1):
+                reps_dict = st["chunks"][i]["reps"]
+
+                if 0 in reps_dict:
+                    noisy = reps_dict[0]
+                else:
+                    noisy = next(iter(reps_dict.values()))
+                fixed = majority_vote_bytes(list(reps_dict.values()))
+
+                raw_noisy_parts.append(noisy)
+                raw_fixed_parts.append(fixed)
+
+            raw_noisy = b"".join(raw_noisy_parts)
+            raw_fixed = b"".join(raw_fixed_parts)
+
+            del self.frames[frame_id]
+            return frame_id, raw_noisy, raw_fixed
+
+    def cleanup(self, max_age_s: float = 900.0):
         now = time.time()
         with self.lock:
             drop = [fid for fid, st in self.frames.items() if (now - st.get("t0", now)) > max_age_s]
@@ -87,7 +122,14 @@ class ImageReassembler:
                 del self.frames[fid]
 
 img_reasm = ImageReassembler()
-latest_image = {"frame_id": None, "png": None, "tif": None}
+
+latest_images = {
+    "frame_id": None,
+    "noisy_png": None,
+    "fixed_png": None,
+    "noisy_tif": None,
+    "fixed_tif": None,
+}
 
 def _enqueue_web(msg: str):
     telemetry_history.append(msg)
@@ -101,7 +143,6 @@ def tm_receiver():
 
     while running:
         data, _ = sock.recvfrom(65535)
-
         try:
             raw_text = data.decode("utf-8", errors="replace").strip()
             pkt = json.loads(raw_text)
@@ -111,36 +152,44 @@ def tm_receiver():
             pkt = None
             pkt_type = None
 
-        # IMG
         if pkt_type == "IMG":
             res = img_reasm.push(pkt)
             if res is not None:
-                frame_id, raw_frame = res
-                print(f"[BBU] IMG frame complete: {frame_id}, bytes={len(raw_frame)}")
+                frame_id, raw_noisy, raw_fixed = res
+                print(f"[BBU] IMG frame complete: {frame_id} bytes_noisy={len(raw_noisy)} bytes_fixed={len(raw_fixed)}")
 
                 try:
-                    img16 = decode_one_frame(raw_frame, 2048, 2048)
-                    out_png = os.path.join(IMG_OUT_DIR, f"frame_{frame_id:05d}.png")
-                    out_tif = os.path.join(IMG_OUT_DIR, f"frame_{frame_id:05d}.tif")
-                    save_png_tiff(img16, out_png, out_tif)
+                    img_noisy = decode_one_frame(raw_noisy, 2048, 2048)
+                    img_fixed = decode_one_frame(raw_fixed, 2048, 2048)
 
-                    latest_image["frame_id"] = frame_id
-                    latest_image["png"] = out_png
-                    latest_image["tif"] = out_tif
+                    noisy_png = os.path.join(IMG_OUT_DIR, f"frame_{frame_id:05d}_noisy.png")
+                    noisy_tif = os.path.join(IMG_OUT_DIR, f"frame_{frame_id:05d}_noisy.tif")
+                    fixed_png = os.path.join(IMG_OUT_DIR, f"frame_{frame_id:05d}_fixed.png")
+                    fixed_tif = os.path.join(IMG_OUT_DIR, f"frame_{frame_id:05d}_fixed.tif")
 
-                    print(f"[BBU] IMG saved: {out_png} + {out_tif}")
+                    save_png_tiff(img_noisy, noisy_png, noisy_tif)
+                    save_png_tiff(img_fixed, fixed_png, fixed_tif)
 
-                    _enqueue_web(f"IMG|{frame_id}|{out_png}|{out_tif}")
+                    latest_images.update({
+                        "frame_id": frame_id,
+                        "noisy_png": noisy_png,
+                        "fixed_png": fixed_png,
+                        "noisy_tif": noisy_tif,
+                        "fixed_tif": fixed_tif,
+                    })
+
+                    print(f"[BBU] IMG saved noisy={noisy_png} fixed={fixed_png}")
+
+                    # Send to web: IMG2|frame_id|noisy_png|fixed_png|noisy_tif|fixed_tif
+                    _enqueue_web(f"IMG2|{frame_id}|{noisy_png}|{fixed_png}|{noisy_tif}|{fixed_tif}")
 
                 except Exception as e:
                     print(f"[BBU] IMG decode failed frame {frame_id}: {e}")
             else:
-                img_reasm.cleanup(max_age_s=180.0)
+                img_reasm.cleanup(max_age_s=900.0)
             continue
 
-        # TM biasa
         _enqueue_web(raw_text)
-
         if DEFAULT_ORBIT.is_visible():
             telemetry_live.append(raw_text)
             if len(telemetry_live) > 2000:
@@ -172,13 +221,11 @@ def tm_server_for_web():
                 else:
                     time.sleep(0.3)
                     continue
-
                 try:
                     conn.sendall((msg + "\n").encode("utf-8"))
                 except Exception:
                     break
-
-                time.sleep(0.15)
+                time.sleep(0.05)
         finally:
             print("[BBU] Web disconnected")
             try:
@@ -216,25 +263,17 @@ def tc_sender():
         if not telecommand_queue:
             time.sleep(0.2)
             continue
-
         st = DEFAULT_ORBIT.get_state()
         if not st["visible"]:
-            print("[BBU] TC queued, waiting visibility")
             time.sleep(0.8)
             continue
 
         tc = telecommand_queue.pop(0)
-
         pkt = {"type": "TC", "cmd": tc, "ts": time.time(), "corrupted": False}
         pkt2 = propagate(pkt, elev_deg=float(st["elev_deg"]), direction="uplink")
         if pkt2 is None:
-            print(f"[BBU] TC DROP (RF): {tc}")
             continue
-        if pkt2.get("corrupted"):
-            print(f"[BBU] TC CORRUPTED -> still sent: {tc}")
-
         sock.sendto(tc.encode("utf-8"), (SAT_IP, SAT_TC_PORT))
-        print(f"[BBU] TC SENT to satellite: {tc}")
         time.sleep(0.2)
 
 def status_printer():
@@ -243,14 +282,13 @@ def status_printer():
         print(
             f"[BBU] Visible={st['visible']} elev={st['elev_deg']:.1f}deg "
             f"DL={st['rate_dl_mbps']*1e3:.1f}kbps UL={st['rate_ul_mbps']*1e3:.1f}kbps | "
-            f"LIVE={len(telemetry_live)} HIST={len(telemetry_history)} TCQ={len(telecommand_queue)} | "
-            f"IMG={latest_image.get('frame_id')}"
+            f"LIVE={len(telemetry_live)} HIST={len(telemetry_history)} | "
+            f"IMG={latest_images.get('frame_id')}"
         )
         time.sleep(3)
 
 if __name__ == "__main__":
-    print("=== BBU NODE STARTED (LEO viswin + IMG) ===")
-
+    print("=== BBU NODE STARTED (LEO viswin + IMG noisy/fixed) ===")
     threads = [
         threading.Thread(target=tm_receiver, daemon=True),
         threading.Thread(target=tm_server_for_web, daemon=True),
@@ -260,7 +298,6 @@ if __name__ == "__main__":
     ]
     for t in threads:
         t.start()
-
     try:
         while True:
             time.sleep(1)
